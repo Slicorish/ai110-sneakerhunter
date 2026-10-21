@@ -2,3 +2,8 @@ streamlit
 pytest
 python-dotenv
 google-genai>=1.0.0
+
+# CA bundle, transitive. Pinned forward past the revoked emSign intermediates,
+# so a cached older wheel can't satisfy this file. google-genai verifies its
+# HTTPS calls against it.
+certifi>=2026.10.19
