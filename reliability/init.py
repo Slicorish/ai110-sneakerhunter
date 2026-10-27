@@ -4,7 +4,7 @@ from .changes import (
     mark_missing, snapshot,
 )
 from .confidence import ConfidenceResult, score_drop
-from .dedupe import (
+from .consolidate import (
     AmbiguousPair, DedupeResult, dedupe, match_level, merge_drops,
     normalize_style_code, normalize_text, resolve_ambiguous,
 )

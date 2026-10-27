@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from . import config
-from .dedupe import normalize_style_code, normalize_text
+from .consolidate import normalize_style_code, normalize_text
 from .schema import Drop, Tier, as_aware
 
 
