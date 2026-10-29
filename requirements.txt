@@ -7,3 +7,5 @@ google-genai>=1.0.0
 # so a cached older wheel can't satisfy this file. google-genai verifies its
 # HTTPS calls against it.
 certifi>=2026.10.19
+
+feedparser

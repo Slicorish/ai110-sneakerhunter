@@ -1,72 +1,46 @@
 import os
-import difflib
+import re
+
 import streamlit as st
 from dotenv import load_dotenv
 
-from bughound_agent import BugHoundAgent
-from llm_client import GeminiClient, MockClient
+from agent import SneakerHunterAgent
+from llm_client import GeminiClient
+from reliability import SeenStore
+from tools.sources import FEEDS
 
 # ----------------------------
 # App setup
 # ----------------------------
-st.set_page_config(page_title="BugHound", page_icon="🐶", layout="wide")
-st.title("🐶 BugHound")
-st.caption("A tiny agent that analyzes code, proposes a fix, and runs simple reliability checks.")
+st.set_page_config(page_title="Sneaker Hunter", page_icon="👟", layout="wide")
+st.title("👟 Sneaker Hunter")
+st.caption("Reads sneaker news feeds, finds upcoming drops, and rates how much to trust each one.")
 
 # Load environment variables from .env if present
 load_dotenv()
 
-# ----------------------------
-# Helpers
-# ----------------------------
-SAMPLE_SNIPPETS = {
-    "print_spam.py": """def greet(name):
-    print("Hello", name)
-    print("Welcome!")
-    return True
-""",
-    "flaky_try_except.py": """def load_data(path):
-    try:
-        data = open(path).read()
-    except:
-        return None
-    return data
-""",
-    "mixed_issues.py": """# TODO: replace with real implementation
-def compute(x, y):
-    print("computing...")
-    try:
-        return x / y
-    except:
-        return 0
-""",
-    "cleanish.py": """import logging
+def safe(text) -> str:
+    """Escape Markdown so text from feeds or the model is shown literally.
 
-def add(a, b):
-    logging.info("Adding numbers")
-    return a + b
-""",
-}
+    Streamlit treats `$...$` as math and `:name[...]` as formatting, so an unescaped
+    price like "$210" or a stray bracket would be eaten or restyled.
+    """
+    return re.sub(r"([\\`*_{}\[\]()<>#+\-.!|~$:&])", r"\\\1", str(text))
 
 
-def render_diff(original: str, revised: str) -> str:
-    """Return a unified diff string."""
-    diff_lines = difflib.unified_diff(
-        original.splitlines(),
-        revised.splitlines(),
-        fromfile="original",
-        tofile="fixed",
-        lineterm="",
-    )
-    return "\n".join(diff_lines)
+def safe_url(url) -> str:
+    """Make a URL safe inside a Markdown link."""
+    return str(url).replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
 
-def require_code_input(code: str) -> bool:
-    if not code.strip():
-        st.warning("Paste some code or load a sample snippet to begin.")
-        return False
-    return True
+TIER_LABELS = {"high": "HIGH", "unconfirmed": "UNCONFIRMED", "log_only": "LOG ONLY"}
+STATUS_LABELS = {"new": "🆕 New", "updated": "🔄 Updated", "unchanged": "✔️ Already reported"}
 
+# Remembers which drops the user has been told about, so repeat runs only announce what is new or changed.
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+STORE_PATH = os.path.join(DATA_DIR, "seen_drops.json")
+# Remembers which feed entries were already analyzed, so repeat runs only spend calls on new posts.
+ENTRY_LOG_PATH = os.path.join(DATA_DIR, "analyzed_entries.json")
 
 # ----------------------------
 # Sidebar controls
@@ -74,17 +48,33 @@ def require_code_input(code: str) -> bool:
 st.sidebar.header("Settings")
 
 mode = st.sidebar.selectbox(
-    "Model mode",
-    [
-        "Heuristic only (no API)",
-        "Gemini (requires API key)",
-    ],
-    help="Heuristic mode runs fully offline. Gemini mode calls the Gemini API for analysis and fix proposal.",
+    "Mode",
+    ["Feeds only (no API)", "Gemini (requires API key)"],
+    help="Feeds only fetches and lists entries. Gemini mode also classifies entries and extracts drops.",
 )
 
-# [cite_start]UPDATED: Added a warning for free-tier users to manage expectations regarding API limits. [cite: 176, 192]
+limit_per_feed = st.sidebar.slider(
+    "Entries per feed",
+    min_value=1,
+    max_value=15,
+    value=3,
+    help="How many recent entries to read from each feed.",
+)
+
+max_calls = st.sidebar.slider(
+    "Max Gemini calls per run",
+    min_value=1,
+    max_value=20,
+    value=10,
+    disabled=(mode != "Gemini (requires API key)"),
+    help="Hard cap. The agent stops calling Gemini once this is used up. Each entry costs 1 call to classify, plus 1 to extract if it announces a release.",
+)
+
 if mode == "Gemini (requires API key)":
-    st.sidebar.warning("⚠️ Gemini Free Tier: You have a limit of ~20 requests. Use Heuristic mode for initial testing to save your quota.")
+    st.sidebar.warning(
+        f"⚠️ Gemini Free Tier: ~20 requests. This run will stop after {max_calls} calls, "
+        "so some entries may not be analyzed. Use Feeds only mode to save your quota."
+    )
 
 model_name = st.sidebar.selectbox(
     "Gemini model",
@@ -99,15 +89,35 @@ temperature = st.sidebar.slider(
     value=0.2,
     step=0.1,
     disabled=(mode != "Gemini (requires API key)"),
-    help="Lower values tend to be more consistent. Higher values tend to be more creative.",
+    help="Lower values tend to be more consistent.",
 )
 
 st.sidebar.divider()
 
-sample_choice = st.sidebar.selectbox(
-    "Load a sample snippet",
-    ["(none)"] + list(SAMPLE_SNIPPETS.keys()),
+remember = st.sidebar.checkbox(
+    "Remember drops between runs",
+    value=True,
+    help="When on, entries already analyzed are skipped (saving Gemini calls), and drops you were already told about are marked 'Already reported' and not summarized again.",
 )
+explain = st.sidebar.checkbox(
+    "Explain ratings in plain language",
+    value=False,
+    disabled=(mode != "Gemini (requires API key)"),
+    help="Costs 1 extra Gemini call per announced drop. The factor list under each drop is always shown.",
+)
+if st.sidebar.button(
+    "Forget remembered drops",
+    disabled=not (os.path.exists(STORE_PATH) or os.path.exists(ENTRY_LOG_PATH)),
+):
+    for path in (STORE_PATH, ENTRY_LOG_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+    st.sidebar.success("Memory cleared. Every entry will be analyzed again.")
+
+st.sidebar.divider()
+st.sidebar.write("**Sources**")
+for feed in FEEDS:
+    st.sidebar.write(f"- {feed['name']}")
 
 show_debug = st.sidebar.checkbox("Show debug details", value=False)
 
@@ -115,15 +125,10 @@ show_debug = st.sidebar.checkbox("Show debug details", value=False)
 # Choose client
 # ----------------------------
 client = None
-client_status = ""
-
-if mode == "Heuristic only (no API)":
-    client = MockClient()
-    client_status = "Using MockClient. No network calls."
+if mode == "Feeds only (no API)":
+    client_status = "No LLM. Entries are fetched but not analyzed."
 else:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        client = None
+    if not os.getenv("GEMINI_API_KEY", "").strip():
         client_status = "Missing GEMINI_API_KEY. Add it to your .env file to use Gemini mode."
     else:
         client = GeminiClient(model_name=model_name, temperature=temperature)
@@ -132,125 +137,144 @@ else:
 st.sidebar.info(client_status)
 
 # ----------------------------
-# Main input
-# ----------------------------
-col_left, col_right = st.columns([1, 1])
-
-with col_left:
-    st.subheader("Input code")
-    if sample_choice != "(none)":
-        default_code = SAMPLE_SNIPPETS[sample_choice]
-    else:
-        default_code = st.session_state.get("code_input", "")
-
-    code_input = st.text_area(
-        "Paste a Python snippet",
-        value=default_code,
-        height=320,
-        placeholder="Paste code here...",
-        label_visibility="collapsed",
-    )
-    st.session_state["code_input"] = code_input
-
-    run_button = st.button("Run BugHound", type="primary", use_container_width=True)
-
-with col_right:
-    st.subheader("Outputs")
-    st.write("Run the workflow to see issues, a proposed fix, and a risk report.")
-
-# ----------------------------
 # Run workflow
 # ----------------------------
-if run_button:
-    if not require_code_input(code_input):
-        st.stop()
+run_button = st.button("Find drops", type="primary", use_container_width=True)
 
-    if mode == "Gemini (requires API key)" and client is None:
-        st.error("Gemini mode is selected, but no API key is available.")
-        st.stop()
+if not run_button:
+    st.write("Run the workflow to see upcoming drops, confidence ratings, and the agent trace.")
+    st.stop()
 
-    agent = BugHoundAgent(client=client)
+if mode == "Gemini (requires API key)" and client is None:
+    st.error("Gemini mode is selected, but no API key is available.")
+    st.stop()
 
-    with st.spinner("BugHound is sniffing around..."):
-        result = agent.run(code_input)
+agent = SneakerHunterAgent(
+    client=client,
+    limit_per_feed=limit_per_feed,
+    max_calls=max_calls if client is not None else None,
+    store=SeenStore(STORE_PATH) if remember else None,
+    entry_log=SeenStore(ENTRY_LOG_PATH) if remember else None,
+    explain=explain and client is not None,
+)
 
-    issues = result.get("issues", [])
-    fixed_code = result.get("fixed_code", "")
-    risk = result.get("risk", {})
-    logs = result.get("logs", [])
+with st.spinner("Hunting through the feeds..."):
+    result = agent.run()
 
-    # Layout for results
-    res_left, res_right = st.columns([1, 1])
+drops = result.get("drops", [])
+rejected = result.get("rejected", [])
+entries = result.get("entries", [])
+skipped = result.get("skipped", [])
+errors = result.get("errors", [])
+logs = result.get("logs", [])
 
-    with res_left:
-        st.subheader("Detected issues")
-        if not issues:
-            st.success("No issues detected by the current analyzer.")
-        else:
-            for i, issue in enumerate(issues, start=1):
-                issue_type = issue.get("type", "Issue")
-                severity = issue.get("severity", "Unknown")
-                msg = issue.get("msg", "").strip()
+for err in errors:
+    st.warning(safe(f"Could not read {err['source']}: {err['error']}"))
 
-                badge = f"{issue_type} | {severity}"
-                st.markdown(f"**{i}. {badge}**")
-                if msg:
-                    st.write(msg)
+if client is not None:
+    st.caption(f"Gemini calls used: {result.get('calls_used', 0)} of {max_calls}")
 
-    with res_right:
-        st.subheader("Risk report")
-        if not risk:
-            st.info("No risk report was produced.")
-        else:
-            score = risk.get("score", None)
-            level = risk.get("level", "unknown")
-            should_autofix = risk.get("should_autofix", None)
-            reasons = risk.get("reasons", [])
+if any("budget" in log.get("message", "") for log in logs):
+    st.warning("Call budget reached: some entries were not analyzed. Raise the cap or lower entries per feed.")
 
-            top_cols = st.columns(3)
-            with top_cols[0]:
-                st.metric("Risk level", str(level).upper())
-            with top_cols[1]:
-                st.metric("Score", "-" if score is None else int(score))
-            with top_cols[2]:
-                st.metric("Auto-fix?", "-" if should_autofix is None else ("YES" if should_autofix else "NO"))
+if any("API Error" in log.get("message", "") for log in logs):
+    st.warning("⚠️ API Request Failed: some entries were skipped because of a limit or network error.")
 
-            if reasons:
-                st.write("**Reasons:**")
-                for r in reasons:
-                    st.write(f"- {r}")
+# ----------------------------
+# Drops
+# ----------------------------
+st.subheader("Upcoming drops")
 
+if client is None:
+    st.info("Feeds only mode: no drops were extracted. Switch to Gemini mode to analyze the entries below.")
+elif not drops:
+    st.info("No upcoming drops were found in these entries.")
+
+for item in drops:
+    drop = item["drop"]
+    confidence = item["confidence"]
+    tier = confidence["tier"]
+
+    name = safe(" ".join(p for p in (drop["brand"], drop["model"], drop["colorway"]) if p) or drop["raw_name"] or "(unnamed drop)")
+    with st.container(border=True):
+        head_left, head_right = st.columns([3, 1])
+        with head_left:
+            st.markdown(f"### {name}")
+            st.caption(STATUS_LABELS.get(item["change"]["status"], ""))
+        with head_right:
+            st.metric(TIER_LABELS.get(tier, tier), f"{confidence['score']:.2f}")
+
+        if item["message"]:
+            st.info(safe(item["message"]))
+        elif item["notify_worthy"]:
+            st.caption("No summary was written (call budget reached or the call failed). It will be announced again next run.")
+        if item["explanation"]:
+            exp = item["explanation"]
+            st.markdown(f"**{safe(exp['summary'])}**")
+            for reason in exp["reasons"]:
+                st.write(f"- {safe(reason)}")
+            if exp.get("to_improve"):
+                st.caption(f"To raise confidence: {safe(exp['to_improve'])}")
+        if item["change"]["info"]:
+            for ch in item["change"]["info"]["changes"]:
+                st.caption(safe(f"Changed {ch['field']}: {ch['previous_value']} → {ch['new_value']}"))
+
+        when = drop["release_datetime"] or drop["date_text"] or "Date unknown"
+        details = [f"**When:** {safe(when)} ({safe(drop['date_precision'])})", f"**Type:** {safe(drop['release_type'])}"]
+        if drop["price"] is not None:
+            details.append(f"**Price:** {safe(drop['price'])} {safe(drop['currency'] or '')}".strip())
+        if drop["retailer"]:
+            details.append(f"**Retailer:** {safe(drop['retailer'])}")
+        st.write("  \n".join(details))
+
+        reported_by = ", ".join(s["source_id"] for s in drop["sources"])
+        st.caption(f"Reported by: {safe(reported_by)}")
+        for src in drop["sources"]:
+            if src["url"]:
+                st.markdown(f"[{safe(src['source_id'])}]({safe_url(src['url'])})")
+
+        if drop["evidence"]:
+            st.caption(f"Evidence: “{safe(drop['evidence'])}”")
+
+        with st.expander("Why this rating"):
+            for factor in confidence["factors"]:
+                st.write(f"- **{safe(factor['factor'])}** ({safe(factor['status'])}): {safe(factor['note'])}")
+
+if rejected:
+    with st.expander(f"{len(rejected)} drop(s) rejected by validation"):
+        for item in rejected:
+            drop = item["drop"]
+            label = drop["raw_name"] or drop["model"] or "(unnamed drop)"
+            st.write(f"**{safe(label)}**: {safe('; '.join(item['errors']))}")
+
+st.divider()
+
+# ----------------------------
+# Entries
+# ----------------------------
+st.subheader(f"Feed entries ({len(entries)})")
+for entry in entries:
+    st.markdown(f"- [{safe(entry['title'])}]({safe_url(entry['link'])}) — {safe(entry['source'])}")
+
+if skipped:
+    with st.expander(f"{len(skipped)} entr{'y' if len(skipped) == 1 else 'ies'} skipped without a Gemini call"):
+        st.caption("Check this list to make sure no real drop was skipped by the title filter.")
+        for item in skipped:
+            st.write(f"- {safe(item['title'])} — {safe(item['source'])} ({safe(item['reason'])})")
+
+st.divider()
+
+# ----------------------------
+# Trace
+# ----------------------------
+st.subheader("Agent trace")
+if not logs:
+    st.info("No trace logs were produced.")
+else:
+    for entry in logs:
+        st.write(f"**{safe(entry.get('step', 'LOG'))}:** {safe(entry.get('message', ''))}")
+
+if show_debug:
     st.divider()
-
-    # [cite_start]UPDATED: Check if a fallback occurred due to API limits/errors and notify the user. [cite: 119, 128]
-    if any("API Error" in log.get("message", "") for log in logs):
-        st.warning("⚠️ API Request Failed: BugHound hit a limit or network error and used heuristic rules instead.")
-
-    st.subheader("Proposed fix")
-    if not fixed_code.strip():
-        st.warning("No fix was produced. This can happen if the agent refused or had parsing errors.")
-    else:
-        fix_cols = st.columns([1, 1])
-
-        with fix_cols[0]:
-            st.text_area("Fixed code", value=fixed_code, height=320)
-
-        with fix_cols[1]:
-            diff_text = render_diff(code_input, fixed_code)
-            st.text_area("Diff (unified)", value=diff_text, height=320)
-
-    st.divider()
-
-    st.subheader("Agent trace")
-    if not logs:
-        st.info("No trace logs were produced.")
-    else:
-        for entry in logs:
-            step = entry.get("step", "LOG")
-            message = entry.get("message", "")
-            st.write(f"**{step}:** {message}")
-
-    if show_debug:
-        st.divider()
-        st.subheader("Debug payload")
-        st.json(result)
+    st.subheader("Debug payload")
+    st.json(result)

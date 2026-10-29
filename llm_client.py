@@ -1,28 +1,16 @@
 import os
-from typing import Optional
-
-
-class MockClient:
-    """
-    Offline stand-in for an LLM client.
-    This lets the app run without an API key.
-    """
-
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
-        # Very small, predictable behavior for demos.
-        if "Return ONLY valid JSON" in system_prompt:
-            # Purposely not JSON to force fallback unless students change behavior.
-            return "I found some issues, but I'm not returning JSON right now."
-        return "# MockClient: no rewrite available in offline mode.\n"
 
 
 class GeminiClient:
     """
-    Minimal Gemini API wrapper with added error resilience.
+    Minimal Gemini API wrapper.
 
     Requirements:
     - google-genai installed
     - GEMINI_API_KEY set in environment (or loaded via python-dotenv)
+
+    Most prompts the agent sends ask for JSON, so responses default to JSON mode
+    to cut down on unparseable output. Pass json_mode=False for plain text.
     """
 
     def __init__(self, model_name: str = "gemini-flash-lite-latest", temperature: float = 0.2):
@@ -32,31 +20,32 @@ class GeminiClient:
                 "Missing GEMINI_API_KEY. Create a .env file and set GEMINI_API_KEY=..."
             )
 
-        # Import here so heuristic mode doesn't require the dependency at import time.
+        # Import here so the app can start without the dependency in feeds-only mode.
         from google import genai
+        from google.genai import types
 
         self.client = genai.Client(api_key=api_key)
+        self._types = types
         self.model_name = model_name
         self.temperature = float(temperature)
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
+    def complete(self, system_prompt: str, user_prompt: str, json_mode: bool = True) -> str:
         """
-        Sends a single request to Gemini.
+        Sends a single request to Gemini and returns the response text.
 
-        If an error occurs, it returns an empty string, triggering the agent's
-        heuristic fallback logic.
+        API errors (rate limits, network, blocked content) are raised, not hidden,
+        so the agent can log them and tell them apart from an empty response.
         """
-        try:
-            merged_prompt = f"{system_prompt}\n\n{user_prompt}".strip()
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=merged_prompt,
-            )
+        config = self._types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=self.temperature,
+            response_mime_type="application/json" if json_mode else "text/plain",
+        )
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=user_prompt,
+            config=config,
+        )
 
-            # Defensive: response.text can be None or raise an error if blocked by filters.
-            return response.text or ""
-
-        except Exception:
-            # Returning empty string allows the agent to detect the failure
-            # and switch to offline rules.
-            return ""
+        # response.text is None when the model returns no text (e.g. a safety block).
+        return response.text or ""

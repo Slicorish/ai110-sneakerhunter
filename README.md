@@ -1,30 +1,62 @@
-# 🐶 BugHound
+# 👟 Sneaker Hunter
 
-BugHound is a small, agent-style debugging tool. It analyzes a Python code snippet, proposes a fix, and runs basic reliability checks before deciding whether the fix is safe to apply automatically.
+Sneaker Hunter is a small, agent-style tracker for upcoming sneaker releases. It reads a curated set of sneaker news RSS feeds, finds posts that announce an upcoming drop, extracts the details, and rates how much to trust each one before showing it to you.
 
 ---
 
-## What BugHound Does
+## What Sneaker Hunter Does
 
-Given a short Python snippet, BugHound:
+1. **Fetches** recent entries from the feeds listed in `tools/sources.py`
+   - Sneaker News, Nice Kicks, KicksOnFire
+   - A feed that fails is reported and skipped; the rest still load
 
-1. **Analyzes** the code for potential issues  
-   - Uses heuristics in offline mode  
-   - Uses Gemini when API access is enabled  
+2. **Classifies** each entry (Gemini)
+   - Is this an upcoming drop, a raffle, a rumor, a roundup, a recap, or irrelevant?
+   - Only entries that mention an upcoming release continue
 
-2. **Proposes a fix**  
-   - Either heuristic-based or LLM-generated  
-   - Attempts minimal, behavior-preserving changes  
+3. **Extracts** structured drop details (Gemini)
+   - Brand, model, colorway, style code, date and how precise it is, price, retailer, release type
+   - Fields the text does not state stay empty rather than guessed
 
-3. **Assesses risk**  
-   - Scores the fix  
-   - Flags high-risk changes  
-   - Decides whether the fix should be auto-applied or reviewed by a human  
+4. **Validates** each drop with plain code, no LLM
+   - Checks identity, timing, price, style code, and that the quoted evidence really appears in the entry text
 
-4. **Shows its work**  
-   - Displays detected issues  
-   - Shows a diff between original and fixed code  
-   - Logs each agent step
+5. **Consolidates and scores** (no LLM)
+   - The same drop reported by several sources is merged
+   - Each drop gets a confidence score and tier: `high`, `unconfirmed`, or `log_only`
+   - The score depends on source trust, how many independent sources agree, date precision, release type, and more
+
+6. **Tracks what changed** (no LLM)
+   - Remembers which drops you were already told about, in `data/seen_drops.json` (gitignored)
+   - A drop is marked new, updated (date, price, precision, or type changed, or its tier went up), or already reported
+
+7. **Summarizes** (Gemini)
+   - Writes a short notification for each new or updated drop that is not `log_only`
+   - Optionally explains the confidence rating in plain language (the rating itself is always computed by code)
+   - If a summary call fails or the budget runs out, the drop stays "new" and is announced again next run
+
+8. **Shows its work**
+   - Ranked drop cards with the reasons behind each rating
+   - Drops that failed validation, feeds that failed, and a step-by-step agent trace
+
+---
+
+## Project Layout
+
+```text
+app.py                 Streamlit UI
+agent.py               SneakerHunterAgent: fetch -> classify -> extract -> validate -> consolidate
+llm_client.py          Gemini wrapper
+tools/
+  rss.py               fetch_feed(url), fetch_all_feeds()
+  sources.py           The curated feed list, with a trust level for each
+prompts/               Prompt templates for classify, extract, summarize, explain
+data/                  Local memory of announced drops (created on first run, gitignored)
+reliability/           Schema, validators, dedupe, confidence scoring, change tracking
+tests/                 Agent and RSS tests
+```
+
+To add or remove a source, edit `tools/sources.py`. Only add feeds that allow automated readers. Hypebeast, for example, answers bots with a challenge page and returns nothing, so it is left out.
 
 ---
 
@@ -47,27 +79,19 @@ pip install -r requirements.txt
 
 ---
 
-## Running in Offline (Heuristic) Mode
-
-No API key required.
+## Running without an API key
 
 ```bash
-streamlit run bughound_app.py
+streamlit run app.py
 ```
 
-In the sidebar, select:
-
-* **Model mode:** Heuristic only (no API)
-
-This mode uses simple pattern-based rules and is useful for testing the workflow without network access.
+In the sidebar, select **Mode: Feeds only (no API)**, then click **Find drops**. This fetches and lists the latest feed entries but does not analyze them.
 
 ---
 
 ## Running with Gemini
 
 ### 1. Set up your API key
-
-Copy the example file:
 
 ```bash
 cp .env.example .env
@@ -79,24 +103,23 @@ Edit `.env` and add your Gemini API key:
 GEMINI_API_KEY=your_real_key_here
 ```
 
+`.env` is gitignored. Never put a real key in `.env.example`, which is tracked.
+
 ### 2. Run the app
 
 ```bash
-streamlit run bughound_app.py
+streamlit run app.py
 ```
 
-In the sidebar, select:
+In the sidebar, select **Mode: Gemini (requires API key)**, then choose the model, entries per feed, and **Max Gemini calls per run**.
 
-* **Model mode:** Gemini (requires API key)
-* Choose a Gemini model and temperature
-
-BugHound will now use Gemini for analysis and fix generation, while still applying local reliability checks.
+**Free tier note:** the free tier allows about 20 requests. Each entry costs one call to classify, plus one to extract if it announces a release. Each announced drop costs one more call for its summary, and another if you turn on plain-language explanations. The call cap is a hard limit: the agent stops calling Gemini once it is used up, and entries are read round-robin across feeds so every source gets coverage. Calls used are shown after each run.
 
 ---
 
 ## Running Tests
 
-Tests focus on **reliability logic** and **agent behavior**, not the UI.
+Tests cover the RSS tools, the agent workflow (with a fake LLM, so no API calls), and the reliability layer.
 
 ```bash
 pytest
@@ -104,6 +127,6 @@ pytest
 
 You should see tests covering:
 
-* Risk scoring and guardrails
-* Heuristic fallbacks when LLM output is invalid
-* End-to-end agent workflow shape
+* Feed parsing, limits, and failure handling
+* The agent workflow, including bad LLM output, API errors, and the call budget
+* Validation, dedupe, confidence scoring, and change detection

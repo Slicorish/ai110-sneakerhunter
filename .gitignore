@@ -30,3 +30,6 @@ Thumbs.db
 # Coverage reports
 .coverage
 htmlcov/
+
+# Local memory of announced drops
+data/

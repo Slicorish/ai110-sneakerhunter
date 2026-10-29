@@ -26,5 +26,16 @@ Schema:
   "price", "currency", "retailer", "url", "evidence",
   "extraction_notes", "model_confidence" } ] }
 
+Allowed values. Use exactly these strings, or null if not stated:
+- date_precision: "exact_datetime" (date and time), "date_only" (a specific
+  day), "month_only", "season", "unknown"
+- release_type: "general_release", "raffle", "draw", "restock", "rumor",
+  "unknown"
+- model_confidence: "high", "medium", "low"
+- price: a number only (no currency symbol). currency: a 3-letter code such
+  as "USD".
+- release_datetime: ISO 8601, e.g. "2026-11-14" or "2026-11-14T10:00:00".
+  Use only the fields listed in the schema. Do not add any others.
+
 current_date: {{current_date}}
 source_url: {{source_url}}
